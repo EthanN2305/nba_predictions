@@ -1,0 +1,20 @@
+# virtual env / caches
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# harvested data is reproducible via `python -m wp_engine.collect all` — never commit
+data/raw/pbp/
+data/raw/states/
+data/raw/game_index_*.parquet
+data/raw/failed_*.json
+data/raw/parse_failures.json
+data/harvest.log
+
+# models & processed matrices (Phases 2-3 decide what to version)
+data/processed/*.parquet
+data/models/*.pkl
+
+# committed test fixtures live in tests/fixtures/ and are NOT ignored

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wp-engine"
+version = "0.1.0"
+description = "NBA Live Win-Probability Engine"
+requires-python = ">=3.11"
+dependencies = [
+    "nba_api>=1.7,<2.0",
+    "pandas>=2.2,<3.0",
+    "pyarrow>=16.0",
+    "pydantic>=2.7,<3.0",
+    "tqdm>=4.66",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wp_engine", "src/api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "network: tests that hit the live NBA stats API (deselect with '-m \"not network\"')",
+    "slow: long-running tests",
+]
+
+[tool.coverage.run]
+source = ["wp_engine"]
