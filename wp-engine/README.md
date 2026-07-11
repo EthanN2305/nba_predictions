@@ -10,8 +10,8 @@ Built in six phases (see [`../docs/`](../docs/) for the full plans):
 | 1 | Historical play-by-play harvester + raw `GameState` dataset + schemas | ✅ done |
 | 2 | Shared `features.py` (offline + online) + processed feature matrices | ✅ done |
 | 3 | Trained, calibrated LightGBM model + evaluation report | ✅ done |
-| 4 | Live poller + FastAPI + WebSocket inference service | ⏳ next |
-| 5 | React live win-probability chart | — |
+| 4 | Live poller + FastAPI + WebSocket inference service | ✅ done |
+| 5 | React live win-probability chart | ⏳ next |
 | 6 | Hardening: e2e replay regression suite, skew guards, Docker | — |
 
 ## Setup
@@ -102,6 +102,27 @@ model: monotone-constrained LightGBM (P(home win) non-decreasing in `score_diff`
 Brier, so no calibrator is applied. Phase 4 consumes only
 `train.load_predictor()`.
 
+## Phase 4 pipeline (live backend)
+
+```bash
+uvicorn api.main:app                                        # the service
+python -m wp_engine.replay --game-id 0022300061 --speed 60  # serve + replay a game
+python -m wp_engine.replay --game-id 0022300061 --print --speed 0  # pipeline → stdout
+curl -X POST 'localhost:8000/replay/0022300061?speed=60'    # replay into a running server
+```
+
+REST: `GET /healthz`, `GET /games`, `GET /games/{id}/history`,
+`POST /replay/{id}?speed=`. WebSocket `/ws/games/{id}`: snapshot frame on
+connect, then per-event update frames (contract documented in `api/main.py`
+docstring and `HANDOFF.md`). Env: `WP_DATA_DIR`, `WP_CORS_ORIGINS`,
+`WP_ENABLE_LIVE=1` (start the scoreboard-driven live pollers).
+
+> **⚠️ Live-feed caveat:** `cdn.nba.com` (all `nba_api.live` endpoints) was
+> Akamai-blocked from the development network, so the live adapter is built
+> against the documented liveData payload shape + synthesized fixtures, and
+> **replay mode is the primary dev/demo path**. Verify against a real live
+> payload before relying on `WP_ENABLE_LIVE=1` (see `HANDOFF.md`).
+
 ## Testing — every phase ships pytest coverage
 
 **The whole suite must be green before a phase is considered done.** Run it from
@@ -164,18 +185,20 @@ on 20 sampled games in each season.
 .venv/bin/python -m pytest tests/test_splits.py tests/test_model.py tests/test_latency.py
 ```
 
-### Phase 4 — live backend (planned)
+### Phase 4 — live backend ✅ (implemented, 37 tests)
 
-Required by [`docs/04-phase-backend-live.md`](../docs/04-phase-backend-live.md):
+The ISO clock parser was already unit-tested in Phase 1 (`tests/test_parse.py`)
+and is reused verbatim for the live feed.
 
-- `tests/test_live_clock.py` — ISO clock parser (`PT11M23.00S`, `PT0M09.40S`, malformed).
-- `tests/test_live_adapter.py` — adapter against committed live-payload fixtures.
-- `tests/test_poller.py` — dedup/amendment logic (same `actionNumber` → take latest).
-- `tests/test_ws.py` — WebSocket integration via `TestClient`: connect → snapshot →
-  fake event → update frame arrives.
+| Test file | What it proves |
+|-----------|----------------|
+| `tests/test_live_adapter.py` | liveData actions → GameState: display clock (Q/OT), score trusted only on made scoring actions + monotonic guard, foul counting excl. offensive/technical with period reset, bonus, timeout decrement, explicit-possession mapping, **out-of-order sort + dedup/amendment (same `actionNumber` → latest wins)**, malformed events skipped without crashing |
+| `tests/test_inference.py` | `LivePredictor`: GameState → valid `WinProbUpdate`; features stay stateful across events (a late run raises wp); OT clock display; `is_replay` flag |
+| `tests/test_poller.py` | `GamePoller.step` emits exactly one update per new event (idempotent on cumulative payloads, amendments don't re-emit); 3s→30s backoff when the feed goes quiet; 5 consecutive fetch failures → degraded (never crashes, recovers); `GameHub` history bounds + pub/sub; `GameDirectory` starts live games once and stops finished ones |
+| `tests/test_ws.py` | Full REST + WebSocket contract with `TestClient`: healthz, empty history, then a REAL fixture game replayed through the app — snapshot frame, per-event update frames (`is_replay`, valid wp), `replay_finished` control frame, DEN home win ends > 0.9, history backfill, `/games` meta, 404 on unknown replay |
 
 ```bash
-.venv/bin/python -m pytest tests/test_live_clock.py tests/test_live_adapter.py \
+.venv/bin/python -m pytest tests/test_live_adapter.py tests/test_inference.py \
     tests/test_poller.py tests/test_ws.py
 ```
 

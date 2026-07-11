@@ -5,7 +5,7 @@ feature builder (Phase 2), and the live adapter (Phase 4). Field names must
 never change without updating all phases.
 """
 
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -36,6 +36,21 @@ class GameState(BaseModel):
     home_timeouts_remaining: int | None = Field(default=None, ge=0)
     away_timeouts_remaining: int | None = Field(default=None, ge=0)
     event_num: int = Field(description="ordering key within the game")
+
+
+class WinProbUpdate(BaseModel):
+    """One win-probability tick pushed to clients (Phase 4 wire format)."""
+
+    game_id: str
+    event_num: int
+    period: int = Field(ge=1)
+    clock: str = Field(description='display string, e.g. "Q4 02:31" / "OT1 00:45"')
+    home_score: int = Field(ge=0)
+    away_score: int = Field(ge=0)
+    wp_home: float = Field(gt=0, lt=1, description="calibrated P(home win)")
+    ts: datetime = Field(description="server time the update was produced")
+    description: str | None = Field(default=None, description='e.g. "Curry 3PT"')
+    is_replay: bool = False
 
 
 class GameRecord(BaseModel):
