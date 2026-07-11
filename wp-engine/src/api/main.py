@@ -15,7 +15,6 @@ WebSocket contract (/ws/games/{game_id}):
 
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from wp_engine.config import get_settings, setup_logging
 from wp_engine.hub import GameHub
 from wp_engine.inference import LivePredictor
 from wp_engine.live import fetch_live_pbp, fetch_scoreboard
@@ -33,8 +33,6 @@ from wp_engine.schemas import WinProbUpdate
 from wp_engine.train import load_predictor
 
 logger = logging.getLogger(__name__)
-
-PING_INTERVAL_SECONDS = 20.0
 
 
 def _default_data_dir() -> Path:
@@ -51,12 +49,21 @@ def create_app(
 ) -> FastAPI:
     """App factory. Tests inject tiny artifacts; production uses defaults."""
 
+    settings = get_settings()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        setup_logging()
+        app.state.settings = settings
         app.state.hub = GameHub()
-        app.state.data_dir = Path(data_dir) if data_dir else _default_data_dir()
+        app.state.data_dir = (
+            Path(data_dir)
+            if data_dir
+            else (settings.data_dir or _default_data_dir())
+        )
         app.state.predictor = load_predictor(
-            models_dir=models_dir, data_dir=app.state.data_dir
+            models_dir=models_dir or settings.models_dir,
+            data_dir=app.state.data_dir,
         )
         app.state.tasks: set[asyncio.Task] = set()
         app.state.replaying: set[str] = set()
@@ -69,21 +76,27 @@ def create_app(
 
         app.state.spawn = _spawn
 
-        if os.environ.get("WP_ENABLE_LIVE") == "1":
+        if settings.enable_live:
             _spawn(_run_live_directory(app))
-        if replay_on_start is not None:
-            game_id, speed = replay_on_start
+        startup_replay = replay_on_start or (
+            (settings.replay_game, settings.replay_speed)
+            if settings.replay_game
+            else None
+        )
+        if startup_replay is not None:
+            game_id, speed = startup_replay
             _spawn(_run_replay(app, game_id, speed))
 
         yield
+        # graceful shutdown: tell clients, then cancel background work
+        app.state.hub.notify_shutdown()
         for task in list(app.state.tasks):
             task.cancel()
 
     app = FastAPI(title="wp-engine", lifespan=lifespan)
-    origins = os.environ.get("WP_CORS_ORIGINS", "http://localhost:5173")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[o.strip() for o in origins.split(",") if o.strip()],
+        allow_origins=settings.origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -124,6 +137,7 @@ async def _run_live_directory(app: FastAPI) -> None:
                 is_replay=False,
                 status="live",
             )
+            settings = app.state.settings
             poller = GamePoller(
                 game_id=game_id,
                 home_team_id=home.get("teamId"),
@@ -133,6 +147,8 @@ async def _run_live_directory(app: FastAPI) -> None:
                 ),
                 publish=hub.publish,
                 fetch=lambda: fetch_live_pbp(game_id, client),
+                poll_interval=settings.poll_interval,
+                idle_interval=settings.idle_interval,
                 on_degraded=lambda: hub.publish_event(
                     game_id, {"type": "feed_degraded", "game_id": game_id}
                 ),
@@ -142,6 +158,7 @@ async def _run_live_directory(app: FastAPI) -> None:
         directory = GameDirectory(
             start_poller=start_poller,
             stop_poller=lambda game_id: hub.set_meta(game_id, status="final"),
+            interval=app.state.settings.scoreboard_interval,
         )
         await directory.run(lambda: fetch_scoreboard(client))
 
@@ -172,10 +189,20 @@ def _register_routes(app: FastAPI) -> None:
     @app.websocket("/ws/games/{game_id}")
     async def ws_game(websocket: WebSocket, game_id: str) -> None:
         await websocket.accept()
+        settings = websocket.app.state.settings
         hub: GameHub = websocket.app.state.hub
         queue = hub.subscribe(game_id)
+        logger.info("ws connected", extra={"game_id": game_id})
+
+        async def send(payload: dict) -> None:
+            # backpressure: a client that can't keep up gets dropped instead
+            # of stalling the broadcast loop
+            await asyncio.wait_for(
+                websocket.send_json(payload), timeout=settings.ws_send_timeout
+            )
+
         try:
-            await websocket.send_json(
+            await send(
                 {
                     "type": "snapshot",
                     "updates": [
@@ -186,21 +213,21 @@ def _register_routes(app: FastAPI) -> None:
             while True:
                 try:
                     item = await asyncio.wait_for(
-                        queue.get(), timeout=PING_INTERVAL_SECONDS
+                        queue.get(), timeout=settings.ws_ping_interval
                     )
                 except asyncio.TimeoutError:
-                    await websocket.send_json({"type": "ping"})
+                    await send({"type": "ping"})
                     continue
                 if isinstance(item, WinProbUpdate):
-                    await websocket.send_json(
-                        {"type": "update", **item.model_dump(mode="json")}
-                    )
+                    await send({"type": "update", **item.model_dump(mode="json")})
                 else:
-                    await websocket.send_json(item)
-        except WebSocketDisconnect:
-            pass
+                    await send(item)
+        except (WebSocketDisconnect, asyncio.TimeoutError) as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                logger.warning("ws client too slow, dropping", extra={"game_id": game_id})
         finally:
             hub.unsubscribe(game_id, queue)
+            logger.info("ws disconnected", extra={"game_id": game_id})
 
 
 app = create_app()

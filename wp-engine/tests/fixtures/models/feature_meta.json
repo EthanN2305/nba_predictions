@@ -1,0 +1,42 @@
+{
+  "model": {
+    "type": "lightgbm",
+    "calibration": "raw",
+    "metrics": {
+      "note": "pinned fixture model \u2014 tests only, not the product model"
+    },
+    "num_trees": 150
+  },
+  "feature_columns": [
+    "score_diff",
+    "seconds_remaining",
+    "period",
+    "is_overtime",
+    "diff_per_sqrt_time",
+    "score_total",
+    "lead_changes_so_far",
+    "time_since_lead_change",
+    "largest_lead_home",
+    "largest_lead_away",
+    "possession",
+    "possession_x_time",
+    "home_in_bonus",
+    "away_in_bonus",
+    "foul_diff_period",
+    "home_timeouts_remaining",
+    "away_timeouts_remaining",
+    "timeouts_known",
+    "is_clutch",
+    "run_last_120s",
+    "run_last_300s",
+    "scoring_rate_home_300s",
+    "scoring_rate_away_300s",
+    "fouls_last_300s_diff",
+    "momentum_ewm",
+    "pregame_win_pct_home",
+    "pregame_win_pct_away",
+    "pregame_win_pct_diff",
+    "rest_days_home",
+    "rest_days_away"
+  ]
+}

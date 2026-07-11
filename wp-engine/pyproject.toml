@@ -23,6 +23,8 @@ dependencies = [
     "uvicorn>=0.30",
     "websockets>=12.0",
     "httpx>=0.27",
+    # Phase 6 — hardening
+    "pydantic-settings>=2.3",
 ]
 
 [project.optional-dependencies]

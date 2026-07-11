@@ -1,0 +1,31 @@
+# One-command demo:  docker compose up --build
+# → backend on :8000 auto-replaying DEN–LAL at 60×, frontend on :5173.
+# Works from a clean clone: the backend bootstraps demo data from committed
+# fixtures. Mount a real ./data (harvested + trained) and it is used instead.
+
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      WP_CORS_ORIGINS: http://localhost:5173
+      WP_REPLAY_GAME: "0022300061" # demo: DEN 119-107 LAL at 60x speed
+      WP_REPLAY_SPEED: "60"
+      # WP_ENABLE_LIVE: "1"        # real games — requires cdn.nba.com access
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: http://localhost:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend

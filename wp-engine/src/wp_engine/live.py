@@ -29,7 +29,6 @@ unblocked network before production use (see HANDOFF.md).
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
 
 import httpx
 
@@ -187,19 +186,38 @@ class LiveGameAdapter:
         return states
 
 
+# Courtesy cap on concurrent NBA requests — even with 10+ simultaneous game
+# pollers, at most N requests are in flight. Semaphores bind to the running
+# event loop, so keep one per loop.
+_semaphores: dict[int, asyncio.Semaphore] = {}
+
+
+def _nba_semaphore() -> asyncio.Semaphore:
+    from wp_engine.config import get_settings
+
+    loop_id = id(asyncio.get_running_loop())
+    if loop_id not in _semaphores:
+        _semaphores[loop_id] = asyncio.Semaphore(
+            get_settings().max_concurrent_nba_requests
+        )
+    return _semaphores[loop_id]
+
+
 async def fetch_live_pbp(
     game_id: str, client: httpx.AsyncClient
 ) -> list[dict]:
     """Fetch the raw liveData action list for one game (raises on HTTP error)."""
-    response = await client.get(
-        LIVE_PBP_URL.format(game_id=game_id), headers=LIVE_HEADERS, timeout=10
-    )
+    async with _nba_semaphore():
+        response = await client.get(
+            LIVE_PBP_URL.format(game_id=game_id), headers=LIVE_HEADERS, timeout=10
+        )
     response.raise_for_status()
     return response.json()["game"]["actions"]
 
 
 async def fetch_scoreboard(client: httpx.AsyncClient) -> list[dict]:
     """Fetch today's games from the live scoreboard."""
-    response = await client.get(SCOREBOARD_URL, headers=LIVE_HEADERS, timeout=10)
+    async with _nba_semaphore():
+        response = await client.get(SCOREBOARD_URL, headers=LIVE_HEADERS, timeout=10)
     response.raise_for_status()
     return response.json()["scoreboard"]["games"]

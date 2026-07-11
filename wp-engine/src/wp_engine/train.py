@@ -296,6 +296,8 @@ def save_artifacts(
     )
     meta_path = models_dir / "feature_meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    # the contract travels with the artifacts — load_predictor verifies it
+    meta.setdefault("feature_columns", list(FEATURE_COLUMNS))
     meta["model"] = {
         "type": "lightgbm",
         "calibration": calibration_method,
@@ -318,6 +320,19 @@ def load_predictor(
     booster: lgb.Booster = pickle.loads((models_dir / "model.pkl").read_bytes())
     payload = pickle.loads((models_dir / "calibrator.pkl").read_bytes())
     calibrator = payload["model"]
+
+    # startup skew guard: code, persisted contract and model must agree
+    meta_path = models_dir / "feature_meta.json"
+    if meta_path.exists():
+        meta_columns = json.loads(meta_path.read_text()).get("feature_columns")
+        if meta_columns is not None and meta_columns != list(FEATURE_COLUMNS):
+            raise RuntimeError(
+                "feature skew: feature_meta.json columns != features.FEATURE_COLUMNS"
+            )
+    if booster.feature_name() != list(FEATURE_COLUMNS):
+        raise RuntimeError(
+            "feature skew: model.pkl feature names != features.FEATURE_COLUMNS"
+        )
 
     def predict(frame: pd.DataFrame) -> np.ndarray:
         missing = [c for c in FEATURE_COLUMNS if c not in frame.columns]

@@ -12,7 +12,21 @@ Built in six phases (see [`../docs/`](../docs/) for the full plans):
 | 3 | Trained, calibrated LightGBM model + evaluation report | ✅ done |
 | 4 | Live poller + FastAPI + WebSocket inference service | ✅ done |
 | 5 | React live win-probability chart | ✅ done |
-| 6 | Hardening: e2e replay regression suite, skew guards, Docker | ⏳ next |
+| 6 | Hardening: e2e replay regression suite, skew guards, Docker | ✅ done |
+
+**All six phases complete.** New contributors: read
+[`docs/architecture.md`](docs/architecture.md) first.
+
+## Quickstart (Docker)
+
+```bash
+docker compose up --build
+# → http://localhost:5173 — DEN–LAL replaying at 60× within ~2 minutes
+```
+
+Works from a clean clone: the backend image bootstraps demo data (6 committed
+real games + the pinned test model) via `scripts/bootstrap_demo.py`, which
+never overwrites a real harvested/trained `./data` volume.
 
 ## Setup
 
@@ -215,22 +229,44 @@ pings ignored). `npm run build` gates on zero TypeScript errors. See
 cd frontend && npm test && npm run build
 ```
 
-### Phase 6 — hardening (planned)
+### Phase 6 — hardening ✅ (implemented, 26 tests)
 
-Required by [`docs/06-phase-hardening.md`](../docs/06-phase-hardening.md):
-
-- `tests/e2e/test_replay_pipeline.py` — replay 5 diverse historical games through the
-  full poller→features→model→hub pipeline with a real WebSocket client; final
-  `wp_home` > 0.95 for home wins (< 0.05 for losses); no >25 pp single-event jumps
-  outside the final 2 minutes; all frames validate against `WinProbUpdate`.
-- `tests/e2e/test_golden.py` — committed WP trajectory of one game reproduced within
-  1e-6 (catches silent feature drift).
-- `tests/test_skew_guard.py` — `feature_meta.json` == `FeatureBuilder` output columns ==
-  model's expected columns.
+| Test file | What it proves |
+|-----------|----------------|
+| `tests/e2e/test_replay_pipeline.py` | **6 diverse real games** (wire-to-wire, close loss, OT, 62-pt blowout, low-scoring, 30-pt comeback) replayed through the full adapter→features→model→hub→WebSocket pipeline against the pinned committed model: one tick per parsed event post-dedup, final `wp_home` > 0.95 for home wins / < 0.05 for losses, no >25 pp single-event jump outside the final 2 minutes, every frame validates against `WinProbUpdate` |
+| `tests/e2e/test_golden.py` | Committed DEN–LAL trajectory reproduced within 1e-6 — the silent-drift alarm (regenerate consciously via `scripts/build_golden.py`) |
+| `tests/test_skew_guard.py` | `FeatureBuilder` output == `FEATURE_COLUMNS` == `feature_meta.json` == model's expected columns; `load_predictor` REJECTS mismatched artifacts at startup |
+| `tests/test_monitor.py` | Realized-Brier evaluation per game + overall; retraining recommendation triggers at >20% relative degradation |
+| `tests/test_config.py` | `Settings` env parsing (`WP_*`), JSON log records carry game_id context, `server_closing` reaches every subscriber on shutdown |
+| `tests/test_live_fetch.py` | CDN fetchers against a mocked transport: payload parsing, HTTP errors propagate, concurrent NBA requests capped at 3 |
 
 ```bash
-.venv/bin/python -m pytest tests/e2e/ tests/test_skew_guard.py
+.venv/bin/python -m pytest tests/e2e/ tests/test_skew_guard.py tests/test_monitor.py \
+    tests/test_config.py tests/test_live_fetch.py
 ```
+
+## Drift monitoring
+
+```bash
+python -m wp_engine.monitor --date 2026-04-10          # live-adapter path (needs cdn access)
+python -m wp_engine.monitor --date 2026-04-10 --stats --season 2025-26  # stats fallback
+```
+
+Replays that date's completed games through the pipeline and compares
+realized Brier vs the benchmark in `feature_meta.json`; >20% relative
+degradation prints a retraining recommendation.
+
+## Deployment notes (hobby-scale)
+
+- One small VM, `uvicorn --workers 1`. **More than 1 worker breaks the app**:
+  `GameHub` state (history + subscribers) is per-process, so clients on
+  worker B would miss ticks published on worker A. If scale-out is ever
+  needed, put Redis pub/sub + a capped list behind the same `GameHub` API.
+- Model artifacts: volume-mount `./data` (compose does) or let the image
+  fall back to the pinned demo model.
+- Config via `WP_*` env vars (see `src/wp_engine/config.py`): CORS origins,
+  poll intervals, WS timeouts, `WP_ENABLE_LIVE`, `WP_REPLAY_GAME`.
+- Logs are JSON lines on stdout — point your collector at container stdout.
 
 ## Conventions
 

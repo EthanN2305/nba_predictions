@@ -10,7 +10,14 @@ import pytest
 from wp_engine.features import FEATURE_COLUMNS
 
 FIXTURES = Path(__file__).parent / "fixtures"
-FIXTURE_GAMES = ["0022300061", "0022300062", "0022300083"]
+FIXTURE_GAMES = [
+    "0022300061",  # DEN 119-107 LAL — wire-to-wire home win
+    "0022300062",  # GSW 104-108 PHX — close home loss
+    "0022300083",  # SAS 126-122 HOU — overtime
+    "0022300529",  # OKC 139-77 POR — blowout
+    "0022300927",  # NYK 73-79 PHI — low-scoring home loss
+    "0022301034",  # ATL 120-118 BOS — comeback from 30 down
+]
 FIXTURE_SEASON = "2023-24"
 
 

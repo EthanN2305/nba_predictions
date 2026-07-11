@@ -51,6 +51,13 @@ class GameHub:
     def unsubscribe(self, game_id: str, queue: asyncio.Queue) -> None:
         self._subscribers[game_id].discard(queue)
 
+    def notify_shutdown(self) -> None:
+        """Best-effort ``server_closing`` frame to every subscriber of every
+        game — clients then know the drop is a shutdown, not a crash."""
+        for game_id, queues in self._subscribers.items():
+            if queues:
+                self.publish_event(game_id, {"type": "server_closing"})
+
     def set_meta(self, game_id: str, **meta) -> None:
         """Attach display metadata (tricodes, status, is_replay…) to a game."""
         self._meta.setdefault(game_id, {}).update(meta)
