@@ -133,6 +133,39 @@ class TestScoreParsing:
         with pytest.raises(ParseError):
             parse(events, record=make_record(final_home=50, final_away=60))
 
+    def test_non_monotonic_free_throw_score_is_ignored(self):
+        # Real data (game 0022100016): a legitimate-looking "Free Throw" row
+        # very late in the game carries a corrupted score (0-1) that is LOWER
+        # than the already-reached running score (115-113). Since basketball
+        # scores never decrease, this must be ignored rather than applied.
+        events = [
+            ev(1, "Made Shot", clock="PT00M05.00S", team=HOME_ID,
+               score_home="115", score_away="113"),
+            ev(2, "Free Throw", clock="PT00M03.70S", sub="Free Throw 1 of 2",
+               team=HOME_ID, score_home="0", score_away="1"),
+            ev(3, "period", clock="PT00M00.00S", sub="end",
+               score_home="115", score_away="113"),
+        ]
+        out = parse(events, record=make_record(final_home=115, final_away=113))
+        assert list(out["home_score"]) == [115, 115, 115]
+        assert list(out["away_score"]) == [113, 113, 113]
+
+    def test_instant_replay_row_does_not_overwrite_score_with_stale_value(self):
+        # Real data (game 0022301202): a buzzer-beater 3PT shot makes it 122-112,
+        # then an "Instant Replay" review row and the period-end row both carry a
+        # stale/reverted scoreHome of 119 — not an actual scoring event, so it
+        # must not overwrite the true final score.
+        events = [
+            ev(1, "Made Shot", clock="PT00M00.30S", team=HOME_ID,
+               score_home="122", score_away="112"),
+            ev(2, "Instant Replay", clock="PT00M00.00S", sub="Support Ruling",
+               score_home="119", score_away="112"),
+            ev(3, "period", clock="PT00M00.00S", sub="end",
+               score_home="119", score_away="112"),
+        ]
+        out = parse(events, record=make_record(final_home=122, final_away=112))
+        assert list(out["home_score"]) == [122, 122, 122]
+
 
 class TestPossessionInference:
     def test_full_possession_script(self):

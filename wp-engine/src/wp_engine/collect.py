@@ -246,6 +246,12 @@ TIMEOUTS_PER_TEAM = 7  # post-2017 rules
 # the V3 subType — approximate; see HANDOFF for known edge cases.
 NON_TEAM_FOUL_SUBTYPES = ("Offensive", "Technical", "Double")
 
+# Only these actionTypes are trusted for scoreHome/scoreAway. Administrative
+# rows (Instant Replay, period end/start) sometimes carry a stale or reverted
+# score value — e.g. a shot is made, then a replay-review row echoes the
+# PRE-shot score — and must never override the true running total.
+SCORING_ACTION_TYPES = ("Made Shot", "Free Throw")
+
 _CLOCK_RE = re.compile(r"^PT(\d+)M(\d+(?:\.\d+)?)S$")
 _FT_TRIP_RE = re.compile(r"(\d+) of (\d+)")
 
@@ -406,10 +412,24 @@ def parse_game(
             current_period = period
             home_fouls = away_fouls = 0
 
-        new_home = _parse_score_value(row.get("scoreHome"))
-        new_away = _parse_score_value(row.get("scoreAway"))
-        if new_home is not None and new_away is not None:
-            home_score, away_score = new_home, new_away
+        if action_type in SCORING_ACTION_TYPES:
+            new_home = _parse_score_value(row.get("scoreHome"))
+            new_away = _parse_score_value(row.get("scoreAway"))
+            if new_home is not None and new_away is not None:
+                # Basketball scores never decrease; a handful of real games
+                # carry a corrupted score on an otherwise-legitimate scoring
+                # row (seen on end-of-game free throws). Ignore any update
+                # that would decrease either team's total rather than trust
+                # a single glitched value over the whole game's trajectory.
+                if new_home >= home_score and new_away >= away_score:
+                    home_score, away_score = new_home, new_away
+                else:
+                    logger.warning(
+                        "Game %s: ignoring non-monotonic score %s-%s at event "
+                        "%s (running total was %s-%s)",
+                        game_id, new_home, new_away, row["actionNumber"],
+                        home_score, away_score,
+                    )
 
         if action_type == "Made Shot":
             possession = -side if side else 0

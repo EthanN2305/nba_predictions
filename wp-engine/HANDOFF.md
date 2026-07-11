@@ -53,6 +53,44 @@ deprecated in nba_api ≥1.10). Everything targets **PlayByPlayV3**:
 - Labels: `home_win` (bool) is attached to every row of a parsed game; parse fails
   loudly (`ParseError`) if the parsed final score disagrees with the game index.
 
+## Two bugs found via real-data validation (fixed)
+
+The Checkpoint 1.5 real-game validation suite — and, at full scale, the actual
+3-season harvest — caught two parser bugs that no synthetic test had surfaced
+until real NBA data was run through the pipeline. Both are variants of the same
+underlying issue: a row's `scoreHome`/`scoreAway` cannot always be trusted, even
+when it looks well-formed.
+
+1. **Stale score on administrative rows** (`0022301202`, IND vs BOS): an
+   `"Instant Replay"` review row (and the following `period end` row) echoed the
+   **pre-shot** score instead of the actual result of the preceding made shot.
+2. **Corrupted score on an otherwise-legitimate scoring row** (`0022100016`,
+   `0022100467`, `0022201225`, `0022101139` — all from 2021-22/2022-23): a
+   `"Free Throw"` event very late in the game carried a score field reset to a
+   tiny bogus value (e.g. `0-1` when the true running score was `115-113`).
+   Restricting to scoring `actionType`s alone (fix #1) does NOT catch this,
+   since the actionType here is genuinely `"Free Throw"`.
+
+In every case the parser's score/label cross-check correctly rejected the game
+rather than silently corrupting it (raised `ParseError`, logged to
+`parse_failures.json`) — the resumable batch design meant no data was lost,
+just deferred.
+
+**Fix (two layers, both in `parse_game`):**
+- Only trust `scoreHome`/`scoreAway` on rows where `actionType` is
+  `"Made Shot"` or `"Free Throw"` (`SCORING_ACTION_TYPES`) — the only two ways
+  points can change in basketball. Administrative rows (Instant Replay, period
+  start/end, etc.) are never trusted for scoring.
+- **Monotonicity guard:** even on a trusted scoring row, an update is only
+  applied if it does not *decrease* either team's score — basketball scores
+  never go down. A violating row is logged and ignored, keeping the last known
+  good total.
+
+Regression tests: `test_instant_replay_row_does_not_overwrite_score_with_stale_value`
+and `test_non_monotonic_free_throw_score_is_ignored` in `tests/test_parse.py`.
+After both fixes, all 4 previously-failed games across the 3-season harvest
+reparsed cleanly with zero remaining failures (see Run Results below).
+
 ## Known parsing edge cases (deferred, documented)
 
 - Jump balls: the tip recipient exists only in description text → `possession = 0`
@@ -67,11 +105,12 @@ deprecated in nba_api ≥1.10). Everything targets **PlayByPlayV3**:
 
 ## Data produced in this environment
 
-- `data/raw/game_index_{season}.parquet` — 1,230 games for 2023-24 (indexes also
-  built for 2022-23 / 2021-22 by the same command).
-- `data/raw/pbp/{season}/{game_id}.parquet` — raw V3 frames, ~36 KB/game.
-- `data/raw/states/{season}/{game_id}.parquet` — parsed GameState rows + `home_win`.
-- Run results: see the bottom of this file (filled in from the actual run log).
+- `data/raw/game_index_{season}.parquet` — 1,230 games per season (2023-24,
+  2022-23, 2021-22 regular seasons; 3,690 games total).
+- `data/raw/pbp/{season}/{game_id}.parquet` — raw V3 frames, 3,690 files, 131 MB total.
+- `data/raw/states/{season}/{game_id}.parquet` — parsed GameState rows + `home_win`,
+  3,690 files, 72 MB total.
+- Run results: see the bottom of this file.
 
 ## Exact commands to reproduce
 
@@ -100,6 +139,33 @@ entry, or investigate `data/raw/parse_failures.json` for parse failures.
 - The parser emits rows for non-basketball events too (subs, replay reviews); they
   carry unchanged state and will mostly disappear in the per-second downsampling.
 
-## Run results (2023-24 season, end-to-end in this environment)
+## Run results (all 3 seasons, end-to-end in this environment)
 
-_To be filled from `data/harvest.log` when the background run completes._
+Reproduced by running `python -m wp_engine.collect all --season {season}` for
+2023-24, 2022-23, and 2021-22 (regular seasons only), followed by a re-parse
+pass after the two bug fixes above landed.
+
+| Season | Games indexed | Downloaded | Download failures | Parsed | Parse failures |
+|--------|---------------|------------|--------------------|--------|-----------------|
+| 2023-24 | 1,230 | 1,230 | 0 | 1,230 | 0 |
+| 2022-23 | 1,230 | 1,230 | 0 | 1,230 | 0 |
+| 2021-22 | 1,230 | 1,230 | 0 | 1,230 | 0 |
+| **Total** | **3,690** | **3,690** | **0** | **3,690** | **0** |
+
+Final `python -m wp_engine.collect validate` (across the full 3-season dataset):
+
+```
+games parsed: 3690
+possession inferred on >70% of events: 100.0% of games
+label mismatches: 0.0% (must be 0)
+```
+
+**Operational note (harvest resilience, not a code bug):** the 2021-22 harvest
+took roughly 8 hours of wall-clock instead of the expected ~25 minutes, because
+network connectivity degraded severely partway through (repeated
+`ConnectionError`/`ReadTimeout`, almost certainly the laptop sleeping). This is
+exactly the scenario the Checkpoint 1.3 retry/resumability design targets: the
+harvester kept retrying with backoff, never crashed, and finished with zero
+permanent failures once connectivity returned. No action needed, but if running
+Phase 1 unattended overnight, consider `caffeinate` or an equivalent
+sleep-prevention wrapper to keep it running at normal speed.

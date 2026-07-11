@@ -71,7 +71,12 @@ data/
 .venv/bin/python -m pytest --cov=wp_engine --cov-report=term-missing  # with coverage
 ```
 
-### Phase 1 — data collection ✅ (implemented, 63 tests)
+### Phase 1 — data collection ✅ (implemented, 65 tests, 90% coverage)
+
+Harvested and parsed all 3 target seasons end-to-end in this environment:
+3,690/3,690 games downloaded and parsed with **zero** remaining failures, 100%
+possession coverage, 0% label mismatches. See `HANDOFF.md` for the full run
+report and two real-data parser bugs found and fixed along the way.
 
 | Test file | What it proves |
 |-----------|----------------|
