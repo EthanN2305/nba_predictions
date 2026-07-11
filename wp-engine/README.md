@@ -11,8 +11,8 @@ Built in six phases (see [`../docs/`](../docs/) for the full plans):
 | 2 | Shared `features.py` (offline + online) + processed feature matrices | ✅ done |
 | 3 | Trained, calibrated LightGBM model + evaluation report | ✅ done |
 | 4 | Live poller + FastAPI + WebSocket inference service | ✅ done |
-| 5 | React live win-probability chart | ⏳ next |
-| 6 | Hardening: e2e replay regression suite, skew guards, Docker | — |
+| 5 | React live win-probability chart | ✅ done |
+| 6 | Hardening: e2e replay regression suite, skew guards, Docker | ⏳ next |
 
 ## Setup
 
@@ -202,10 +202,14 @@ and is reused verbatim for the live feed.
     tests/test_poller.py tests/test_ws.py
 ```
 
-### Phase 5 — frontend (planned)
+### Phase 5 — frontend ✅ (implemented, 12 Vitest tests)
 
-Vitest (not pytest — TypeScript): clock→x-axis transform and socket-reducer component
-tests, plus `npm run build` with zero TS errors.
+Vitest (TypeScript): `src/lib/gameTime.test.ts` proves the clock→x-axis
+transform (tipoff→0, quarter math, OT extension past 48'), and
+`src/hooks/socketReducer.test.ts` proves the socket reducer (snapshot replace,
+update dedup by `event_num`, reconnect reset, degraded/final control frames,
+pings ignored). `npm run build` gates on zero TypeScript errors. See
+[`frontend/README.md`](frontend/README.md) for the replay demo.
 
 ```bash
 cd frontend && npm test && npm run build

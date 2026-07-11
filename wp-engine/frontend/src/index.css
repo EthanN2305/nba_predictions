@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+@theme {
+  /* arena-at-night scoreboard palette */
+  --color-court: #0b0e13; /* page background */
+  --color-panel: #141a24; /* cards / chart panel */
+  --color-seam: #232b38; /* borders, gridlines */
+  --color-chalk: #e8ecf2; /* primary text */
+  --color-mist: #8b95a5; /* secondary text */
+  --color-home: #ffb020; /* home amber */
+  --color-away: #4fa3ff; /* away blue */
+  --color-live: #37d67a; /* live pulse */
+
+  --font-score: "Barlow Condensed", sans-serif;
+  --font-clock: "IBM Plex Mono", monospace;
+  --font-body: "Inter", system-ui, sans-serif;
+}
+
+body {
+  background: var(--color-court);
+  color: var(--color-chalk);
+  font-family: var(--font-body);
+}
+
+@keyframes live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.animate-live-pulse {
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-live-pulse {
+    animation: none;
+  }
+}
