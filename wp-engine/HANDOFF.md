@@ -1,171 +1,119 @@
-# Phase 1 → Phase 2 Handoff
+# Phase 2 → Phase 3 Handoff
 
-> Paste this file (plus `docs/00-PROJECT-OVERVIEW.md` and `docs/02-phase-feature-engineering.md`)
-> at the start of the Phase 2 conversation.
+> Paste this file (plus `docs/00-PROJECT-OVERVIEW.md` and `docs/03-phase-model-training.md`)
+> at the start of the Phase 3 conversation. The Phase 1 handoff is archived at
+> `docs/handoffs/phase-1.md`.
 
 ## What was built
 
-Phase 1 (historical data collection) is complete: schemas, game-index builder,
-rate-limited resumable play-by-play harvester, event→GameState parser, validation
-suite, and a CLI. 63 pytest tests, all green; `wp_engine` package coverage 90%.
+Phase 2 (shared feature engineering) is complete: `src/wp_engine/features.py` is
+the SINGLE feature module used by offline training and (later) live inference,
+plus materialized training matrices for all 3 seasons. 127 pytest tests, all
+green (65 Phase 1 + 62 Phase 2).
 
 | File | Contents |
 |------|----------|
-| `src/wp_engine/schemas.py` | Canonical `GameState` + `GameRecord` Pydantic v2 models |
-| `src/wp_engine/collect.py` | `build_game_index`, `harvest_pbp`, `parse_game`, `parse_season`, `validate`, CLI (`python -m wp_engine.collect …`) |
-| `tests/` | 6 test files (see README's Testing section) |
-| `tests/fixtures/` | 3 committed real games: `0022300061` (DEN home win), `0022300062` (GSW home loss), `0022300083` (SAS OT win) + fixture `game_index.parquet` |
+| `src/wp_engine/features.py` | `FeatureBuilder` (stateful incremental), `build_offline`, `PregameContext` + `build_pregame_context`, `build_game_matrix`, `build_season`, `check_parity`, `sanity_table`, CLI (`python -m wp_engine.features {build,parity,sanity} --season …`) |
+| `data/processed/features_{season}.parquet` | training matrices (see row counts below) |
+| `data/models/feature_meta.json` | ordered feature list, dtypes, imputation values, sampling & OT policy, code hash — **Phase 4 must read this, never hard-code columns** |
+| `tests/test_features.py`, `tests/test_pregame.py`, `tests/test_offline_parity.py`, `tests/test_features_cli.py` | Phase 2 test suite (see README Testing section) |
 
-## ⚠️ Deviation: PlayByPlayV2 → PlayByPlayV3
+## The anti-skew design (why parity is trivially guaranteed)
 
-The phase docs specify `nba_api...playbyplayv2`, but **the NBA stats API no longer
-returns PlayByPlayV2 data** (empty JSON; nba_api issue #591, the endpoint is
-deprecated in nba_api ≥1.10). Everything targets **PlayByPlayV3**:
+`build_offline()` deliberately iterates the SAME `FeatureBuilder.update()` that
+Phase 4 will call on live events — feature logic exists in exactly one place
+(the overview's "never duplicate feature logic" rule). The parity tests
+(`tests/test_offline_parity.py` + `python -m wp_engine.features parity`, run on
+20 sampled games per season, all passing) pin this contract so any future
+vectorized reimplementation must stay bit-identical.
 
-- Clock is ISO-8601 duration (`"PT11M23.00S"`) — `collect.parse_clock` handles it and
-  is directly reusable for the Phase 4 live endpoint (same format).
-- Explicit `scoreHome`/`scoreAway` columns (empty strings on non-scoring events →
-  forward-filled; no `"VISITOR - HOME"` string splitting).
-- `actionType`/`subType` are strings (`"Made Shot"`, `"Foul"`/`"Shooting"`), not
-  EVENTMSGTYPE codes.
-- Steals/blocks are separate companion rows with empty `actionType` (no-ops for state).
-- **V3 `actionNumber` is NOT chronological**: subs/amendments are logged late with
-  earlier clocks. `parse_game` sorts events by `(period, clock desc, actionNumber)`.
-  Do the same in Phase 4's live adapter if events arrive out of order.
-- Timeout rows carry `teamId=0`; attribution comes from the `location` column
-  (`"h"`/`"v"`). Team rebounds carry the team id in `personId`.
+## Final feature list (30 columns, all float64, order = `FEATURE_COLUMNS`)
 
-## Schema decisions (respect in all later phases)
+Core clock & score (2.1): `score_diff`, `seconds_remaining`, `period`,
+`is_overtime`, `diff_per_sqrt_time` (= diff/√(sec+1)), `score_total`,
+`lead_changes_so_far` (leader flips only; ties don't count),
+`time_since_lead_change` (game-clock secs, capped 1200; time since tip if none
+yet), `largest_lead_home`, `largest_lead_away`.
 
-- `GameState` matches the overview exactly. One row per event, state **after** the
-  event resolves.
-- `seconds_remaining_total`: regulation = seconds left in period + 720 × remaining
-  periods; **overtime = seconds left in the current OT only** (future OTs unknowable).
-  Phase 2 must add `is_overtime` handling per its docs.
-- **Bonus semantics:** `home_in_bonus = (away_team_fouls_period >= 5)` — i.e. the HOME
-  team shoots FTs on the next common foul. The docs' shorthand (`in_bonus = fouls >= 5`)
-  was ambiguous; this is the semantically meaningful reading. The last-2-minutes bonus
-  rule is NOT modeled (deferred).
-- `possession`: 1 home / −1 away / 0 unknown. Inference rules are documented in
-  `parse_game`'s docstring. Real-game coverage is well above the 70% requirement.
-- `home_timeouts_remaining`/`away_timeouts_remaining`: decrement from 7; nullable
-  Int64 — becomes `None`/NA if tracking turns inconsistent. Impute + flag in Phase 2.
-- Labels: `home_win` (bool) is attached to every row of a parsed game; parse fails
-  loudly (`ParseError`) if the parsed final score disagrees with the game index.
+Game situation (2.2): `possession` (1/−1/0), `possession_x_time`
+(= poss/√(sec+1)), `home_in_bonus`, `away_in_bonus`, `foul_diff_period`,
+`home_timeouts_remaining`, `away_timeouts_remaining` (None → **5.0**, the
+empirical median), `timeouts_known` (0/1 flag), `is_clutch` (last 5:00 of Q4 or
+any OT, |diff| ≤ 5).
 
-## Two bugs found via real-data validation (fixed)
+Rolling momentum (2.3), all over trailing **game-clock** windows (deque of
+(elapsed, delta) tuples inside `FeatureBuilder` — reuse live in Phase 4):
+`run_last_120s`, `run_last_300s`, `scoring_rate_home_300s`,
+`scoring_rate_away_300s` (pts / 5 min, fixed denominator),
+`fouls_last_300s_diff` (from period-counter deltas; period reset handled),
+`momentum_ewm` (decayed sum of per-event diff changes, halflife 90 game-secs:
+`m ← m·0.5^(Δt/90) + Δdiff`).
 
-The Checkpoint 1.5 real-game validation suite — and, at full scale, the actual
-3-season harvest — caught two parser bugs that no synthetic test had surfaced
-until real NBA data was run through the pipeline. Both are variants of the same
-underlying issue: a row's `scoreHome`/`scoreAway` cannot always be trusted, even
-when it looks well-formed.
+Pregame (2.4): `pregame_win_pct_home/away/diff`, `rest_days_home/away`
+(capped 7; opener = 7). Defaults when context absent: win% 0.5, rest 2.0.
 
-1. **Stale score on administrative rows** (`0022301202`, IND vs BOS): an
-   `"Instant Replay"` review row (and the following `period end` row) echoed the
-   **pre-shot** score instead of the actual result of the preceding made shot.
-2. **Corrupted score on an otherwise-legitimate scoring row** (`0022100016`,
-   `0022100467`, `0022201225`, `0022101139` — all from 2021-22/2022-23): a
-   `"Free Throw"` event very late in the game carried a score field reset to a
-   tiny bogus value (e.g. `0-1` when the true running score was `115-113`).
-   Restricting to scoring `actionType`s alone (fix #1) does NOT catch this,
-   since the actionType here is genuinely `"Free Throw"`.
+## Decisions & deviations
 
-In every case the parser's score/label cross-check correctly rejected the game
-rather than silently corrupting it (raised `ParseError`, logged to
-`parse_failures.json`) — the resumable batch design meant no data was lost,
-just deferred.
+- **OT handling:** `seconds_remaining` = regulation seconds left; in OT it is
+  seconds left in the *current* OT only, with `is_overtime = 1` (future OTs are
+  unknowable live). Matches Phase 1's `seconds_remaining_total` convention.
+- **Elapsed game clock** for windows: `game_elapsed_seconds()` — regulation
+  periods 720s, OT 300s. Monotonic within a game.
+- **⚠️ Deviation — `turnovers_last_300s_diff` dropped:** `GameState` carries no
+  turnover signal, and the Golden Rule forbids features the live GameState
+  stream can't produce. Adding turnovers would mean extending the Phase 1
+  schema + reparse + a matching Phase 4 live adapter field — deferred.
+- **Window boundary:** an event exactly `window` seconds old is EXCLUDED
+  (strictly-newer-than comparison). Pinned by test.
+- **Sampling policy:** features are computed on the FULL event stream (running
+  counts must see every event), then downsampled to ≤1 row per game-clock
+  second per game, keeping the last event of each second.
+- **Leakage guards:** pregame context uses strictly-earlier dates only
+  (same-day games excluded); the no-leakage test asserts truncated-prefix
+  features are bit-identical to full-game rows.
 
-**Fix (two layers, both in `parse_game`):**
-- Only trust `scoreHome`/`scoreAway` on rows where `actionType` is
-  `"Made Shot"` or `"Free Throw"` (`SCORING_ACTION_TYPES`) — the only two ways
-  points can change in basketball. Administrative rows (Instant Replay, period
-  start/end, etc.) are never trusted for scoring.
-- **Monotonicity guard:** even on a trusted scoring row, an update is only
-  applied if it does not *decrease* either team's score — basketball scores
-  never go down. A violating row is logged and ignored, keeping the last known
-  good total.
+## Matrix stats (input to Phase 3)
 
-Regression tests: `test_instant_replay_row_does_not_overwrite_score_with_stale_value`
-and `test_non_monotonic_free_throw_score_is_ignored` in `tests/test_parse.py`.
-After both fixes, all 4 previously-failed games across the 3-season harvest
-reparsed cleanly with zero remaining failures (see Run Results below).
+| Season | Games | Rows | home_win row rate |
+|--------|-------|------|-------------------|
+| 2023-24 | 1,230 | 395,238 | 0.545 |
+| 2022-23 | 1,230 | 395,269 | 0.582 |
+| 2021-22 | 1,230 | 396,603 | 0.544 |
+| **Total** | **3,690** | **1,186,110** | — |
 
-## Known parsing edge cases (deferred, documented)
+Columns = 30 features + `game_id` (str), `event_num` (int, per-game ordering
+key), `home_win` (bool label, constant within a game). ~321 rows per game.
 
-- Jump balls: the tip recipient exists only in description text → `possession = 0`
-  until the next attributable event (a handful of events per game).
-- Last-2-minutes bonus rule (≥2 team fouls in final 2:00) not modeled.
-- Foul classification excludes subtypes containing "Offensive"/"Technical"/"Double"
-  from team-foul counts — an approximation of NBA team-foul rules.
-- And-1 possession is handled via the free-throw trip logic (final made FT flips),
-  not via shot+foul pairing.
-- OT timeout rules (2 per OT) not modeled; counts just keep decrementing from the
-  regulation allowance (goes to `None` if it would go negative).
+Sanity fan chart (`python -m wp_engine.features sanity --season 2023-24`)
+looks textbook: home win rate is monotonic in score-diff bucket within every
+time bucket, and fans out toward 0/1 as seconds remaining → 0 (e.g. +10–20
+with <5:00 left → 0.999; −5–2 → 0.155).
 
-## Data produced in this environment
+## What Phase 3 must know
 
-- `data/raw/game_index_{season}.parquet` — 1,230 games per season (2023-24,
-  2022-23, 2021-22 regular seasons; 3,690 games total).
-- `data/raw/pbp/{season}/{game_id}.parquet` — raw V3 frames, 3,690 files, 131 MB total.
-- `data/raw/states/{season}/{game_id}.parquet` — parsed GameState rows + `home_win`,
-  3,690 files, 72 MB total.
-- Run results: see the bottom of this file.
+- **Split by game_id, never by row** (rows within a game share a label and are
+  massively correlated). `event_num` orders rows within a game; `game_id`
+  prefix encodes season (00223… = 2023-24, 00222… = 2022-23, 00221… = 2021-22).
+- Read the feature list from `data/models/feature_meta.json` (or
+  `features.FEATURE_COLUMNS`) — never hard-code column names.
+- `feature_meta.json` is REWRITTEN on every `build` run with the current code
+  hash (`code_version`) — Phase 3 should append model info to it, not clobber it.
+- Monotonic constraints for LightGBM: `score_diff` and `diff_per_sqrt_time`
+  should be non-decreasing → P(home win). Column order comes from
+  `FEATURE_COLUMNS`.
+- No NaNs anywhere in the matrices (enforced by tests); everything float64
+  except the 3 extra columns.
+- Home-court advantage in this data: 54.5–58.2% home win rate by season —
+  the naive baseline for Checkpoint 3.2.
 
 ## Exact commands to reproduce
 
 ```bash
-cd wp-engine
-uv venv --python 3.12 .venv && uv pip install -p .venv/bin/python -e ".[dev]"
-source .venv/bin/activate
-python -m wp_engine.collect all --season 2023-24    # ≈30 min at the 0.7s rate limit
-python -m wp_engine.collect all --season 2022-23
-python -m wp_engine.collect all --season 2021-22
-python -m pytest                                     # full test suite
+cd wp-engine && source .venv/bin/activate
+python -m wp_engine.features build  --season 2023-24   # ≈40s per season
+python -m wp_engine.features build  --season 2022-23
+python -m wp_engine.features build  --season 2021-22
+python -m wp_engine.features parity --season 2023-24   # 20-game skew check
+python -m wp_engine.features sanity --season 2023-24   # fan-chart table
+python -m pytest                                        # full suite (127 tests)
 ```
-
-Everything is resumable: rerunning `all` skips existing files. Failed downloads land
-in `data/raw/failed_{season}.json`; rerun `harvest` to retry them after deleting the
-entry, or investigate `data/raw/parse_failures.json` for parse failures.
-
-## What Phase 2 needs to know
-
-- Input: `data/raw/states/{season}/*.parquet`, one file per game, rows already in
-  chronological order, one row per raw event (NOT yet downsampled — Phase 2 owns the
-  ≤1-row-per-game-second sampling policy).
-- `GameRecord`-shaped `data/raw/game_index_{season}.parquet` is the source for
-  pregame context (standings as-of date, rest days) — compute without future leakage.
-- Timeouts are nullable (`Int64`) — impute median + `timeouts_known` flag per docs.
-- The parser emits rows for non-basketball events too (subs, replay reviews); they
-  carry unchanged state and will mostly disappear in the per-second downsampling.
-
-## Run results (all 3 seasons, end-to-end in this environment)
-
-Reproduced by running `python -m wp_engine.collect all --season {season}` for
-2023-24, 2022-23, and 2021-22 (regular seasons only), followed by a re-parse
-pass after the two bug fixes above landed.
-
-| Season | Games indexed | Downloaded | Download failures | Parsed | Parse failures |
-|--------|---------------|------------|--------------------|--------|-----------------|
-| 2023-24 | 1,230 | 1,230 | 0 | 1,230 | 0 |
-| 2022-23 | 1,230 | 1,230 | 0 | 1,230 | 0 |
-| 2021-22 | 1,230 | 1,230 | 0 | 1,230 | 0 |
-| **Total** | **3,690** | **3,690** | **0** | **3,690** | **0** |
-
-Final `python -m wp_engine.collect validate` (across the full 3-season dataset):
-
-```
-games parsed: 3690
-possession inferred on >70% of events: 100.0% of games
-label mismatches: 0.0% (must be 0)
-```
-
-**Operational note (harvest resilience, not a code bug):** the 2021-22 harvest
-took roughly 8 hours of wall-clock instead of the expected ~25 minutes, because
-network connectivity degraded severely partway through (repeated
-`ConnectionError`/`ReadTimeout`, almost certainly the laptop sleeping). This is
-exactly the scenario the Checkpoint 1.3 retry/resumability design targets: the
-harvester kept retrying with backoff, never crashed, and finished with zero
-permanent failures once connectivity returned. No action needed, but if running
-Phase 1 unattended overnight, consider `caffeinate` or an equivalent
-sleep-prevention wrapper to keep it running at normal speed.

@@ -8,8 +8,8 @@ Built in six phases (see [`../docs/`](../docs/) for the full plans):
 | Phase | Deliverable | Status |
 |-------|-------------|--------|
 | 1 | Historical play-by-play harvester + raw `GameState` dataset + schemas | ✅ done |
-| 2 | Shared `features.py` (offline + online) + processed feature matrices | ⏳ next |
-| 3 | Trained, calibrated LightGBM model + evaluation report | — |
+| 2 | Shared `features.py` (offline + online) + processed feature matrices | ✅ done |
+| 3 | Trained, calibrated LightGBM model + evaluation report | ⏳ next |
 | 4 | Live poller + FastAPI + WebSocket inference service | — |
 | 5 | React live win-probability chart | — |
 | 6 | Hardening: e2e replay regression suite, skew guards, Docker | — |
@@ -60,6 +60,30 @@ data/
 > `scoreHome`/`scoreAway`, `actionType` strings). Bonus: V3's clock format matches the
 > live endpoint used in Phase 4, so the clock parser is shared.
 
+## Phase 2 pipeline (feature engineering)
+
+`src/wp_engine/features.py` is the **single shared feature module** used by both
+training and live inference — `build_offline()` literally iterates the same
+`FeatureBuilder.update()` that Phase 4 calls on live events, so training/serving
+skew is impossible by construction.
+
+```bash
+python -m wp_engine.features build  --season 2023-24   # → data/processed/features_{season}.parquet + feature_meta.json
+python -m wp_engine.features parity --season 2023-24   # offline vs incremental on 20 sampled games
+python -m wp_engine.features sanity --season 2023-24   # empirical WP fan-chart table
+```
+
+30 features (see `FEATURE_COLUMNS` / `data/models/feature_meta.json`): core
+clock/score (`diff_per_sqrt_time`, lead changes, largest leads), game situation
+(possession×time, bonus, timeouts + `timeouts_known` imputation flag, clutch),
+rolling momentum over trailing *game-clock* windows (`run_last_120s/300s`,
+scoring rates, foul diff, `momentum_ewm` with 90s halflife), and leakage-free
+pregame context (win% as-of date, rest days). Matrices are downsampled to at
+most one row per game-clock second (features are computed on the full stream
+first). OT convention: `seconds_remaining` = current-OT seconds with
+`is_overtime = 1`. Deviation: `turnovers_last_300s_diff` was dropped —
+`GameState` carries no turnover signal (see `HANDOFF.md`).
+
 ## Testing — every phase ships pytest coverage
 
 **The whole suite must be green before a phase is considered done.** Run it from
@@ -92,20 +116,22 @@ report and two real-data parser bugs found and fixed along the way.
     tests/test_harvest.py tests/test_parse.py tests/test_parse_season.py tests/test_collect.py
 ```
 
-### Phase 2 — feature engineering (planned)
+### Phase 2 — feature engineering ✅ (implemented, 62 tests)
 
-Required by [`docs/02-phase-feature-engineering.md`](../docs/02-phase-feature-engineering.md):
+All three seasons materialized: 1,186,110 rows / 3,690 games (see `HANDOFF.md`
+for row counts and class balance). `python -m wp_engine.features parity` passed
+on 20 sampled games in each season.
 
-- `tests/test_features.py` — every feature's definition (clock/score interactions,
-  momentum windows over game-clock time, EWM decay math).
-- `tests/test_parity.py` — **offline vs incremental parity**: `build_offline()` must be
-  bit-identical to iterating `FeatureBuilder.update()` on ≥20 sampled real games. This is
-  the training/serving-skew guard — the single most important test in the project.
-- `tests/test_no_leakage.py` — features for a truncated game prefix equal the
-  corresponding rows of the full-game matrix (no look-ahead).
+| Test file | What it proves |
+|-----------|----------------|
+| `tests/test_features.py` | Every feature's definition: clock/score interactions (`diff_per_sqrt_time`), lead-change counting and game-clock timing, largest leads, bonus/foul-diff, timeout imputation + flag, clutch definition, trailing-window runs/scoring rates over **game-clock** time (incl. exact window-boundary exclusion and period-reset foul deltas), exact `momentum_ewm` halflife decay |
+| `tests/test_pregame.py` | Win% uses only strictly-earlier dates (no leakage), rest days from previous game capped at 7, season-opener neutral defaults, pregame values flow into the feature vector |
+| `tests/test_offline_parity.py` | **Offline vs incremental parity** — `build_offline()` bit-identical to iterating `FeatureBuilder.update()` on the 3 real fixture games (incl. OT), and **no-leakage**: truncated-prefix features equal the full-game matrix rows |
+| `tests/test_features_cli.py` | Downsampling keeps the last event per game-clock second and runs on the full stream first; matrix columns = `FEATURE_COLUMNS` + id/event/label; `feature_meta.json` contents (ordered columns, dtypes, imputation values, code hash); season-opener leakage check on the built matrix; `check_parity`; sanity-table probabilities |
 
 ```bash
-.venv/bin/python -m pytest tests/test_features.py tests/test_parity.py tests/test_no_leakage.py
+.venv/bin/python -m pytest tests/test_features.py tests/test_pregame.py \
+    tests/test_offline_parity.py tests/test_features_cli.py
 ```
 
 ### Phase 3 — model training (planned)
