@@ -9,8 +9,8 @@ Built in six phases (see [`../docs/`](../docs/) for the full plans):
 |-------|-------------|--------|
 | 1 | Historical play-by-play harvester + raw `GameState` dataset + schemas | ✅ done |
 | 2 | Shared `features.py` (offline + online) + processed feature matrices | ✅ done |
-| 3 | Trained, calibrated LightGBM model + evaluation report | ⏳ next |
-| 4 | Live poller + FastAPI + WebSocket inference service | — |
+| 3 | Trained, calibrated LightGBM model + evaluation report | ✅ done |
+| 4 | Live poller + FastAPI + WebSocket inference service | ⏳ next |
 | 5 | React live win-probability chart | — |
 | 6 | Hardening: e2e replay regression suite, skew guards, Docker | — |
 
@@ -84,6 +84,24 @@ first). OT convention: `seconds_remaining` = current-OT seconds with
 `is_overtime = 1`. Deviation: `turnovers_last_300s_diff` was dropped —
 `GameState` carries no turnover signal (see `HANDOFF.md`).
 
+## Phase 3 pipeline (model training)
+
+> macOS prerequisite: `brew install libomp` (LightGBM needs OpenMP).
+
+```bash
+python -m wp_engine.train all --trials 30   # splits → baselines → tune → calibrate → report (~15 min)
+```
+
+Produces `data/models/model.pkl` + `calibrator.pkl` (+ model section in
+`feature_meta.json`) and `reports/evaluation.md` with reliability, Brier-by-phase
+and trajectory figures. Split: train = 2021-22 + 2022-23, validation = first half
+of 2023-24 by date, test = second half — **always by game, never by row**. Final
+model: monotone-constrained LightGBM (P(home win) non-decreasing in `score_diff`,
+`diff_per_sqrt_time`). Test metrics: **Brier 0.1565, log loss 0.4663, AUC 0.857**
+(naive 0.2533, 4-feature logistic 0.1681). Raw model beat isotonic/Platt on test
+Brier, so no calibrator is applied. Phase 4 consumes only
+`train.load_predictor()`.
+
 ## Testing — every phase ships pytest coverage
 
 **The whole suite must be green before a phase is considered done.** Run it from
@@ -134,16 +152,13 @@ on 20 sampled games in each season.
     tests/test_offline_parity.py tests/test_features_cli.py
 ```
 
-### Phase 3 — model training (planned)
+### Phase 3 — model training ✅ (implemented, 16 tests)
 
-Required by [`docs/03-phase-model-training.md`](../docs/03-phase-model-training.md):
-
-- `tests/test_splits.py` — splits are by game and by time, never by row; no game_id
-  appears in two splits.
-- `tests/test_model.py` — monotonicity spot checks (P(home win) non-decreasing in
-  `score_diff`), predictor edge cases (tip-off, tie at 0:00, 40-pt blowout, OT, missing
-  timeouts): no NaNs, probabilities strictly inside (0, 1).
-- `tests/test_latency.py` — single-row inference < 10 ms.
+| Test file | What it proves |
+|-----------|----------------|
+| `tests/test_splits.py` | Splits are by game and by time, never by row: no game_id in two splits, train = the two older seasons, eval season halved by **date** (not id), deterministic |
+| `tests/test_model.py` | Naive baseline is game-level (not row-level) home win rate; logistic uses the 4 classic features and beats chance; `evaluate` returns Brier/log-loss/AUC; **monotonicity** (P(home win) non-decreasing in `score_diff` sweep); artifact save/load round-trip via `load_predictor` (valid probabilities, missing-column rejection, edge states incl. imputed timeouts); report generator writes `evaluation.md` + ≥3 figures |
+| `tests/test_latency.py` | Against the REAL trained artifacts (skipped on fresh clones): single-row inference < 10 ms; edge states (tip-off, tie at 0:00, ±40 blowout, OT, imputed timeouts) give no NaNs, probs in (0,1), blowout > 0.95; tip-off reflects home-court advantage |
 
 ```bash
 .venv/bin/python -m pytest tests/test_splits.py tests/test_model.py tests/test_latency.py

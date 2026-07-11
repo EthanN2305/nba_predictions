@@ -1,119 +1,93 @@
-# Phase 2 → Phase 3 Handoff
+# Phase 3 → Phase 4 Handoff
 
-> Paste this file (plus `docs/00-PROJECT-OVERVIEW.md` and `docs/03-phase-model-training.md`)
-> at the start of the Phase 3 conversation. The Phase 1 handoff is archived at
-> `docs/handoffs/phase-1.md`.
+> Paste this file (plus `docs/00-PROJECT-OVERVIEW.md`, `docs/04-phase-backend-live.md`
+> and `docs/handoffs/phase-2.md`) at the start of the Phase 4 conversation.
+> Earlier handoffs: `docs/handoffs/phase-1.md`, `docs/handoffs/phase-2.md`.
 
 ## What was built
 
-Phase 2 (shared feature engineering) is complete: `src/wp_engine/features.py` is
-the SINGLE feature module used by offline training and (later) live inference,
-plus materialized training matrices for all 3 seasons. 127 pytest tests, all
-green (65 Phase 1 + 62 Phase 2).
+Phase 3 (training, calibration, evaluation) is complete: `src/wp_engine/train.py`
+runnable as `python -m wp_engine.train all`, persisted artifacts, and
+`reports/evaluation.md`. 143 pytest tests, all green.
 
 | File | Contents |
 |------|----------|
-| `src/wp_engine/features.py` | `FeatureBuilder` (stateful incremental), `build_offline`, `PregameContext` + `build_pregame_context`, `build_game_matrix`, `build_season`, `check_parity`, `sanity_table`, CLI (`python -m wp_engine.features {build,parity,sanity} --season …`) |
-| `data/processed/features_{season}.parquet` | training matrices (see row counts below) |
-| `data/models/feature_meta.json` | ordered feature list, dtypes, imputation values, sampling & OT policy, code hash — **Phase 4 must read this, never hard-code columns** |
-| `tests/test_features.py`, `tests/test_pregame.py`, `tests/test_offline_parity.py`, `tests/test_features_cli.py` | Phase 2 test suite (see README Testing section) |
+| `src/wp_engine/train.py` | `make_splits`, baselines, `fit_gbt`/`tune_gbt`, OOF calibration, `save_artifacts`, **`load_predictor()`**, `write_report`, `run_all`, CLI |
+| `data/models/model.pkl` | LightGBM Booster (pickled), 204 trees, monotone-constrained |
+| `data/models/calibrator.pkl` | `{"method": "raw", "model": None}` — see calibration note |
+| `data/models/feature_meta.json` | feature contract + `"model"` section (metrics, params, num_trees) |
+| `reports/evaluation.md` + `reports/figures/` | metrics table, reliability diagram, Brier by phase, 6 trajectory plots, importance table |
+| `tests/test_splits.py`, `tests/test_model.py`, `tests/test_latency.py` | Phase 3 suite |
 
-## The anti-skew design (why parity is trivially guaranteed)
+## The predictor API contract (the ONLY thing Phase 4 calls)
 
-`build_offline()` deliberately iterates the SAME `FeatureBuilder.update()` that
-Phase 4 will call on live events — feature logic exists in exactly one place
-(the overview's "never duplicate feature logic" rule). The parity tests
-(`tests/test_offline_parity.py` + `python -m wp_engine.features parity`, run on
-20 sampled games per season, all passing) pin this contract so any future
-vectorized reimplementation must stay bit-identical.
+```python
+from wp_engine.train import load_predictor
+predict = load_predictor()            # loads data/models/* once — do this at startup
+probs = predict(frame)                # frame: pd.DataFrame containing at least the
+                                      # 30 FEATURE_COLUMNS (any order, extras ignored)
+                                      # → np.ndarray of calibrated P(home win)
+```
 
-## Final feature list (30 columns, all float64, order = `FEATURE_COLUMNS`)
+- Raises `ValueError("feature frame is missing columns: […]")` on missing features.
+- Single-row latency: **< 1 ms** measured (test asserts < 10 ms) — plenty of
+  headroom for per-event live inference.
+- Feed it exactly what `FeatureBuilder.update()` returns
+  (`pd.DataFrame([features_dict])`).
 
-Core clock & score (2.1): `score_diff`, `seconds_remaining`, `period`,
-`is_overtime`, `diff_per_sqrt_time` (= diff/√(sec+1)), `score_total`,
-`lead_changes_so_far` (leader flips only; ties don't count),
-`time_since_lead_change` (game-clock secs, capped 1200; time since tip if none
-yet), `largest_lead_home`, `largest_lead_away`.
+## Final metrics (held-out test = 2nd half of 2023-24 by date, split by game)
 
-Game situation (2.2): `possession` (1/−1/0), `possession_x_time`
-(= poss/√(sec+1)), `home_in_bonus`, `away_in_bonus`, `foul_diff_period`,
-`home_timeouts_remaining`, `away_timeouts_remaining` (None → **5.0**, the
-empirical median), `timeouts_known` (0/1 flag), `is_clutch` (last 5:00 of Q4 or
-any OT, |diff| ≤ 5).
+| model | Brier ↓ | log loss ↓ | AUC ↑ |
+|-------|---------|-----------|-------|
+| naive (train home rate 0.563) | 0.2533 | 0.6997 | 0.500 |
+| logistic (4 features) | 0.1681 | 0.4921 | 0.832 |
+| **GBT raw (shipped)** | **0.1565** | **0.4663** | **0.857** |
+| GBT + isotonic | 0.1569 | 0.4676 | 0.857 |
+| GBT + Platt | 0.1584 | 0.4786 | 0.857 |
 
-Rolling momentum (2.3), all over trailing **game-clock** windows (deque of
-(elapsed, delta) tuples inside `FeatureBuilder` — reuse live in Phase 4):
-`run_last_120s`, `run_last_300s`, `scoring_rate_home_300s`,
-`scoring_rate_away_300s` (pts / 5 min, fixed denominator),
-`fouls_last_300s_diff` (from period-counter deltas; period reset handled),
-`momentum_ewm` (decayed sum of per-event diff changes, halflife 90 game-secs:
-`m ← m·0.5^(Δt/90) + Δdiff`).
+Brier by phase: Q1 0.215 → Q2 0.188 → Q3 0.140 → Q4(>5min) 0.102; clutch 0.177.
 
-Pregame (2.4): `pregame_win_pct_home/away/diff`, `rest_days_home/away`
-(capped 7; opener = 7). Defaults when context absent: win% 0.5, rest 2.0.
+## Chosen hyperparameters
 
-## Decisions & deviations
+`learning_rate=0.03, num_leaves=31, min_child_samples=50, feature_fraction=0.7,
+lambda_l2=1.0, n_estimators=204` (early-stopping best iteration on the val
+half-season; 30-trial random search; monotone +1 on `score_diff` and
+`diff_per_sqrt_time`, tuned by validation log loss).
 
-- **OT handling:** `seconds_remaining` = regulation seconds left; in OT it is
-  seconds left in the *current* OT only, with `is_overtime = 1` (future OTs are
-  unknowable live). Matches Phase 1's `seconds_remaining_total` convention.
-- **Elapsed game clock** for windows: `game_elapsed_seconds()` — regulation
-  periods 720s, OT 300s. Monotonic within a game.
-- **⚠️ Deviation — `turnovers_last_300s_diff` dropped:** `GameState` carries no
-  turnover signal, and the Golden Rule forbids features the live GameState
-  stream can't produce. Adding turnovers would mean extending the Phase 1
-  schema + reparse + a matching Phase 4 live adapter field — deferred.
-- **Window boundary:** an event exactly `window` seconds old is EXCLUDED
-  (strictly-newer-than comparison). Pinned by test.
-- **Sampling policy:** features are computed on the FULL event stream (running
-  counts must see every event), then downsampled to ≤1 row per game-clock
-  second per game, keeping the last event of each second.
-- **Leakage guards:** pregame context uses strictly-earlier dates only
-  (same-day games excluded); the no-leakage test asserts truncated-prefix
-  features are bit-identical to full-game rows.
+## Calibration note (deviation-ish)
 
-## Matrix stats (input to Phase 3)
+Isotonic and Platt were fit on GroupKFold(5) out-of-fold predictions over
+train+val as specified — but the RAW model beat both on test Brier (LightGBM
+trained on ~980k rows with logloss objective is already well calibrated), so
+`calibrator.pkl` stores `method="raw"`, `model=None` and `load_predictor`
+applies identity. The reliability diagram shows mild overconfidence in the
+0.4–0.8 band; revisit after Phase 6 if it matters. `apply_calibrator` handles
+isotonic/Platt/None uniformly, so swapping later is a one-line retrain.
 
-| Season | Games | Rows | home_win row rate |
-|--------|-------|------|-------------------|
-| 2023-24 | 1,230 | 395,238 | 0.545 |
-| 2022-23 | 1,230 | 395,269 | 0.582 |
-| 2021-22 | 1,230 | 396,603 | 0.544 |
-| **Total** | **3,690** | **1,186,110** | — |
+## What Phase 4 must know
 
-Columns = 30 features + `game_id` (str), `event_num` (int, per-game ordering
-key), `home_win` (bool label, constant within a game). ~321 rows per game.
-
-Sanity fan chart (`python -m wp_engine.features sanity --season 2023-24`)
-looks textbook: home win rate is monotonic in score-diff bucket within every
-time bucket, and fans out toward 0/1 as seconds remaining → 0 (e.g. +10–20
-with <5:00 left → 0.999; −5–2 → 0.155).
-
-## What Phase 3 must know
-
-- **Split by game_id, never by row** (rows within a game share a label and are
-  massively correlated). `event_num` orders rows within a game; `game_id`
-  prefix encodes season (00223… = 2023-24, 00222… = 2022-23, 00221… = 2021-22).
-- Read the feature list from `data/models/feature_meta.json` (or
-  `features.FEATURE_COLUMNS`) — never hard-code column names.
-- `feature_meta.json` is REWRITTEN on every `build` run with the current code
-  hash (`code_version`) — Phase 3 should append model info to it, not clobber it.
-- Monotonic constraints for LightGBM: `score_diff` and `diff_per_sqrt_time`
-  should be non-decreasing → P(home win). Column order comes from
-  `FEATURE_COLUMNS`.
-- No NaNs anywhere in the matrices (enforced by tests); everything float64
-  except the 3 extra columns.
-- Home-court advantage in this data: 54.5–58.2% home win rate by season —
-  the naive baseline for Checkpoint 3.2.
+- Load once at startup: `predict = load_predictor()`; per event build features
+  with the SAME `FeatureBuilder` (`features.py`) — never re-implement.
+- Sort live events like Phase 1 did: V3 `actionNumber` is NOT chronological —
+  sort by `(period, clock desc, actionNumber)` before feeding `FeatureBuilder`.
+- Live clock format is identical to historical V3 (`PT11M23.00S`):
+  `collect.parse_clock` is directly reusable.
+- **⚠️ Environment blocker discovered:** `cdn.nba.com` (ALL `nba_api.live`
+  endpoints + todaysScoreboard) returns Akamai **403 Access Denied** from this
+  network, while `stats.nba.com` works fine. Live-payload fixtures could not be
+  captured here. Phase 4 must therefore: (1) code the live adapter defensively
+  against the documented liveData schema (`extra="ignore"`, fallbacks), (2)
+  make replay mode (Checkpoint 4.4) the primary dev/demo path, and (3) verify
+  against a real live payload from a non-blocked network before production use.
+- `feature_meta.json` now has a `"model"` section — the skew guard in Phase 6
+  should compare its `feature_columns` against both `FEATURE_COLUMNS` and the
+  booster's `feature_name()`.
 
 ## Exact commands to reproduce
 
 ```bash
 cd wp-engine && source .venv/bin/activate
-python -m wp_engine.features build  --season 2023-24   # ≈40s per season
-python -m wp_engine.features build  --season 2022-23
-python -m wp_engine.features build  --season 2021-22
-python -m wp_engine.features parity --season 2023-24   # 20-game skew check
-python -m wp_engine.features sanity --season 2023-24   # fan-chart table
-python -m pytest                                        # full suite (127 tests)
+brew install libomp                      # macOS only, once
+python -m wp_engine.train all --trials 30   # ≈15 min end to end
+python -m pytest                            # 143 tests
 ```

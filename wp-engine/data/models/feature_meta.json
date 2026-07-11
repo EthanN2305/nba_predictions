@@ -71,5 +71,37 @@
   "sampling": "features computed on the full event stream, then downsampled to at most one row per game-clock second per game (last event of each second wins)",
   "ot_handling": "seconds_remaining = regulation seconds left; in OT it is the seconds left in the current OT only, with is_overtime = 1",
   "label": "home_win",
-  "code_version": "5eabebe3b8b8"
+  "code_version": "5eabebe3b8b8",
+  "model": {
+    "type": "lightgbm",
+    "calibration": "raw",
+    "metrics": {
+      "test": {
+        "brier": 0.1565303668028199,
+        "log_loss": 0.4663248127379847,
+        "auc": 0.8570810870990778
+      },
+      "baselines": {
+        "naive (train home rate)": {
+          "brier": 0.25325545779650643,
+          "log_loss": 0.6997121934260718,
+          "auc": 0.5
+        },
+        "logistic (4 features)": {
+          "brier": 0.1680584654855272,
+          "log_loss": 0.4921347584363246,
+          "auc": 0.8323961453316616
+        }
+      },
+      "params": {
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "min_child_samples": 50,
+        "feature_fraction": 0.7,
+        "lambda_l2": 1.0,
+        "n_estimators": 204
+      }
+    },
+    "num_trees": 204
+  }
 }
